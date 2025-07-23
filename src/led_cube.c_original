@@ -1,0 +1,368 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+//#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "uart.h"
+
+#define L1_PIN      PD5
+#define L2_PIN      PD4
+#define L3_PIN      PD3
+#define L4_PIN      PD2
+#define DATA_PIN    PB3 
+#define CLK_PIN     PB5  
+#define LATCH_PIN   PB2
+#define BT_LED PB0
+
+#define MAX_ANIMATIONS  2
+#define MAX_FRAMES      53
+#define NR_LAYERS       4
+
+#define BT_BUFFER_SIZE  15
+
+typedef struct
+{
+  uint16_t data[NR_LAYERS];
+} Frame;
+
+typedef struct
+{
+  uint8_t speed;
+  uint8_t time;
+  uint8_t nr_frames;
+  Frame frames[MAX_FRAMES];
+} Animation;
+
+const uint8_t LAYER_PINS[NR_LAYERS] = {L1_PIN, L2_PIN, L3_PIN, L4_PIN};
+
+Animation animations[MAX_ANIMATIONS];
+uint8_t current_animation = 0;
+uint8_t current_frame = 0;
+uint8_t timer_tick = 0;
+uint8_t animation_time = 0;
+volatile bool f_draw_frame = false;
+bool pauze = false;
+
+// BLUETOOTH variables
+/*char*/uint8_t bt_receive_buffer[BT_BUFFER_SIZE] = {0};
+int bt_index = 0;
+
+// BAM modulation variables
+volatile int bit_pos = 1;
+
+void init(void);
+void initialize_animations(void);
+void next_animation(void);
+void draw_frame(void);
+void shiftOut_spi(uint8_t data);
+
+bool bt_data_collected(void)
+{   
+   if(UART_available())
+   {
+     UART_readBytesUntil('\n', bt_receive_buffer, BT_BUFFER_SIZE);
+   
+     return true;
+   }
+   return false;
+}
+
+int main(void)
+{
+    cli();
+    init();
+    initialize_animations();
+    sei();
+
+    while(1)
+    {
+        // receive serial data from BT                      
+        /*
+        if (bt_data_collected())
+        {    
+            //uart_puts(bt_receive_buffer);             
+            if (strcmp((char*)bt_receive_buffer, "pauze") == 0)
+            {
+                PORTB |= (1<<BT_LED);      
+                pauze = true;       
+            }
+            else if (strcmp((char*)bt_receive_buffer, "continue") == 0)
+            {
+                PORTB &= ~(1<<BT_LED);
+                pauze = false;
+            }
+            else if (strcmp((char*)bt_receive_buffer, "help") == 0)
+            {
+                UART_sendString("pauze-continue-help");
+            }                               
+        } 
+        */
+
+              
+        if (f_draw_frame)
+        {    
+            draw_frame();   
+        
+            if (!pauze)
+            {
+                timer_tick++;
+                if (timer_tick % (animations[current_animation].speed) == 0)
+                {
+                    current_frame++;
+                    timer_tick = 0;
+                    if(current_frame == animations[current_animation].nr_frames) 
+                    {
+                        animation_time++;
+                        current_frame = 0;
+                        if (animation_time == animations[current_animation].time)
+                        {
+                            next_animation();
+                        }
+                    }
+                }
+            }
+        }                     
+    }
+}
+
+void init()
+{
+    // init GPIO pins
+    // output pins    
+    DDRD |= ((1 << L1_PIN) | (1 << L2_PIN) | (1 << L3_PIN) | (1 << L4_PIN));    
+    // layer pins are initially 'high' because they drive a pnp transistor
+    PORTD |= ((1 << L1_PIN) | (1 << L2_PIN) | (1 << L3_PIN) | (1 << L4_PIN));
+
+    // init LED
+    DDRB |= ((1 << BT_LED));
+    PORTB &= ~((1 << BT_LED));
+
+    // init 16bit timer - generate interrupt every 20ms (50fps)
+    //prescaler 256, 1s = 62500 -> 20ms = 1250
+    TCCR1B |= ((1<<CS12) | (0<<CS11) | (0<<CS10));
+    TCCR1A |= ((0<<WGM11) | (0<<WGM10));
+    TCCR1B |= ((0<<WGM13) | (1<<WGM12));    
+    OCR1A = 1250;
+    TIMSK1 = (1<<OCIE1A);
+
+    // init 8bit timer - BAM modulation
+    //prescaler 256, 1s = 62500 -> 8bit BAM periode = 256ticks = 244Hz
+    //TCCR0B |= ((1<<CS02) | (0<<CS01) | (0<<CS00));
+    //TCCR0A |= ((1<<WGM01) | (0<<WGM00));
+    //TCCR0B |= ((0<<WGM02));
+    //OCR0A = bit_pos;
+    //TIMSK0 = (1<<OCIE0A); 
+        
+    // init SPI for data transfer to shift registers
+    DDRB |= ((1 << DATA_PIN) | (1 << CLK_PIN) | (1 << LATCH_PIN));
+    PORTB &= ~((1 << DATA_PIN) | (1 << CLK_PIN) | (1 << LATCH_PIN));
+    SPCR |= (/*(1 << SPIE) |*/ (1 << SPE) | (0 << DORD) | (1 << MSTR));
+
+    // init UART for bluetooth (BT) communication
+    UART_begin(9600, UART_ASYNC_NORMAL, UART_NO_PARITY, UART_8_BIT);
+     
+}
+
+void initialize_animations(void)
+{
+    // ROTATE_HORIZONTAL
+    Animation rotate_horizontal;
+    Frame rotate_horizontal_frame1 = {{0xF000, 0x0F00, 0x00F0, 0x000F}};
+    Frame rotate_horizontal_frame2 = {{0x0000, 0xFFFF, 0x0000, 0x0000}};
+    Frame rotate_horizontal_frame3 = {{0x000F, 0x00F0, 0x0F00, 0xF000}};
+    Frame rotate_horizontal_frame4 = {{0x00F0, 0x00F0, 0x00F0, 0x00F0}};
+    rotate_horizontal.speed = 10;
+    rotate_horizontal.time = 5;
+    rotate_horizontal.nr_frames = 4;   
+    memset(rotate_horizontal.frames, 0, MAX_FRAMES*sizeof(Frame)); 
+    rotate_horizontal.frames[0] = rotate_horizontal_frame1;
+    rotate_horizontal.frames[1] = rotate_horizontal_frame2;
+    rotate_horizontal.frames[2] = rotate_horizontal_frame3;
+    rotate_horizontal.frames[3] = rotate_horizontal_frame4;
+
+    // CARROUSEL
+    Animation carrousel;
+    Frame carrousel_frame1 = {{0x0001, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame2 = {{0x0003, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame3 = {{0x0007, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame4 = {{0x000F, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame5 = {{0x008F, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame6 = {{0x088F, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame7 = {{0x888F, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame8 = {{0xC88F, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame9 = {{0xE88F, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame10 = {{0xF88F, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame11 = {{0xF98F, 0x0000, 0x0000, 0x0000}};
+    Frame carrousel_frame12 = {{0xF99F, 0x0000, 0x0000, 0x0000}};
+
+    Frame carrousel_frame13 = {{0x0000, 0x0001, 0x0000, 0x0000}};
+    Frame carrousel_frame14 = {{0x0000, 0x0003, 0x0000, 0x0000}};
+    Frame carrousel_frame15 = {{0x0000, 0x0007, 0x0000, 0x0000}};
+    Frame carrousel_frame16 = {{0x0000, 0x000F, 0x0000, 0x0000}};
+    Frame carrousel_frame17 = {{0x0000, 0x008F, 0x0000, 0x0000}};
+    Frame carrousel_frame18 = {{0x0000, 0x088F, 0x0000, 0x0000}};
+    Frame carrousel_frame19 = {{0x0000, 0x888F, 0x0000, 0x0000}};
+    Frame carrousel_frame20 = {{0x0000, 0xC88F, 0x0000, 0x0000}};
+    Frame carrousel_frame21 = {{0x0000, 0xE88F, 0x0000, 0x0000}};
+    Frame carrousel_frame22 = {{0x0000, 0xF88F, 0x0000, 0x0000}};
+    Frame carrousel_frame23 = {{0x0000, 0xF98F, 0x0000, 0x0000}};
+    Frame carrousel_frame24 = {{0x0000, 0xF99F, 0x0000, 0x0000}};
+
+    Frame carrousel_frame25 = {{0x0000, 0x0000, 0x0001, 0x0000}};
+    Frame carrousel_frame26 = {{0x0000, 0x0000, 0x0003, 0x0000}};
+    Frame carrousel_frame27 = {{0x0000, 0x0000, 0x0007, 0x0000}};
+    Frame carrousel_frame28 = {{0x0000, 0x0000, 0x000F, 0x0000}};
+    Frame carrousel_frame29 = {{0x0000, 0x0000, 0x008F, 0x0000}};
+    Frame carrousel_frame30 = {{0x0000, 0x0000, 0x088F, 0x0000}};
+    Frame carrousel_frame31 = {{0x0000, 0x0000, 0x888F, 0x0000}};
+    Frame carrousel_frame32 = {{0x0000, 0x0000, 0xC88F, 0x0000}};
+    Frame carrousel_frame33 = {{0x0000, 0x0000, 0xE88F, 0x0000}};
+    Frame carrousel_frame34 = {{0x0000, 0x0000, 0xF88F, 0x0000}};
+    Frame carrousel_frame35 = {{0x0000, 0x0000, 0xF98F, 0x0000}};
+    Frame carrousel_frame36 = {{0x0000, 0x0000, 0xF99F, 0x0000}};
+
+    Frame carrousel_frame37 = {{0x0000, 0x0000, 0x0000, 0x0001}};
+    Frame carrousel_frame38 = {{0x0000, 0x0000, 0x0000, 0x0003}};
+    Frame carrousel_frame39 = {{0x0000, 0x0000, 0x0000, 0x0007}};
+    Frame carrousel_frame40 = {{0x0000, 0x0000, 0x0000, 0x000F}};
+    Frame carrousel_frame41 = {{0x0000, 0x0000, 0x0000, 0x008F}};
+    Frame carrousel_frame42 = {{0x0000, 0x0000, 0x0000, 0x088F}};
+    Frame carrousel_frame43 = {{0x0000, 0x0000, 0x0000, 0x888F}};
+    Frame carrousel_frame44 = {{0x0000, 0x0000, 0x0000, 0xC88F}};
+    Frame carrousel_frame45 = {{0x0000, 0x0000, 0x0000, 0xE88F}};
+    Frame carrousel_frame46 = {{0x0000, 0x0000, 0x0000, 0xF88F}};
+    Frame carrousel_frame47 = {{0x0000, 0x0000, 0x0000, 0xF98F}};
+    Frame carrousel_frame48 = {{0x0000, 0x0000, 0x0000, 0xF99F}};
+    Frame carrousel_frame49 = {{0x0000, 0x0000, 0x0000, 0x0660}};
+    Frame carrousel_frame50 = {{0x0000, 0x0000, 0x0660, 0x0000}};
+    Frame carrousel_frame51 = {{0x0000, 0x0660, 0x0000, 0x0000}}; 
+    Frame carrousel_frame52 = {{0x0660, 0x0000, 0x0000, 0x0000}}; 
+
+    carrousel.speed = 4;
+    carrousel.time = 2;
+    carrousel.nr_frames = 52;   
+    memset(carrousel.frames, 0, MAX_FRAMES*sizeof(Frame)); 
+    carrousel.frames[0] = carrousel_frame1;
+    carrousel.frames[1] = carrousel_frame2;
+    carrousel.frames[2] = carrousel_frame3;
+    carrousel.frames[3] = carrousel_frame4;
+    carrousel.frames[4] = carrousel_frame5;
+    carrousel.frames[5] = carrousel_frame6;
+    carrousel.frames[6] = carrousel_frame7;
+    carrousel.frames[7] = carrousel_frame8;
+    carrousel.frames[8] = carrousel_frame9;
+    carrousel.frames[9] = carrousel_frame10;
+    carrousel.frames[10] = carrousel_frame11;
+    carrousel.frames[11] = carrousel_frame12;
+    carrousel.frames[12] = carrousel_frame13;
+    carrousel.frames[13] = carrousel_frame14;
+    carrousel.frames[14] = carrousel_frame15;
+    carrousel.frames[15] = carrousel_frame16;
+    carrousel.frames[16] = carrousel_frame17;
+    carrousel.frames[17] = carrousel_frame18;
+    carrousel.frames[18] = carrousel_frame19;
+    carrousel.frames[19] = carrousel_frame20;
+    carrousel.frames[20] = carrousel_frame21;
+    carrousel.frames[21] = carrousel_frame22;
+    carrousel.frames[22] = carrousel_frame23;
+    carrousel.frames[23] = carrousel_frame24;
+    carrousel.frames[24] = carrousel_frame25;
+    carrousel.frames[25] = carrousel_frame26;
+    carrousel.frames[26] = carrousel_frame27;
+    carrousel.frames[27] = carrousel_frame28;
+    carrousel.frames[28] = carrousel_frame29;
+    carrousel.frames[29] = carrousel_frame30;
+    carrousel.frames[30] = carrousel_frame31;
+    carrousel.frames[31] = carrousel_frame32;
+    carrousel.frames[32] = carrousel_frame33;
+    carrousel.frames[33] = carrousel_frame34;
+    carrousel.frames[34] = carrousel_frame35;
+    carrousel.frames[35] = carrousel_frame36;
+    carrousel.frames[36] = carrousel_frame37;
+    carrousel.frames[37] = carrousel_frame38;
+    carrousel.frames[38] = carrousel_frame39;
+    carrousel.frames[39] = carrousel_frame40;
+    carrousel.frames[40] = carrousel_frame41;
+    carrousel.frames[41] = carrousel_frame42;
+    carrousel.frames[42] = carrousel_frame43;
+    carrousel.frames[43] = carrousel_frame44;
+    carrousel.frames[44] = carrousel_frame45;
+    carrousel.frames[45] = carrousel_frame46;
+    carrousel.frames[46] = carrousel_frame47;
+    carrousel.frames[47] = carrousel_frame48;
+    carrousel.frames[48] = carrousel_frame49;
+    carrousel.frames[49] = carrousel_frame50;
+    carrousel.frames[50] = carrousel_frame51;
+    carrousel.frames[51] = carrousel_frame52;
+  
+    // MOVING CUBES
+    Animation moving_cubes;
+    Frame moving_cubes1 = {{0x3300, 0x3300, 0x0000, 0x0000}};
+    Frame moving_cubes2 = {{0x0000, 0x0660, 0x0660, 0x0000}};
+    Frame moving_cubes3 = {{0x0000, 0x0000, 0x00CC, 0x00CC}};
+    Frame moving_cubes4 = {{0x0000, 0x0000, 0x0CC0, 0x0CC0}};
+    Frame moving_cubes5 = {{0x0000, 0x0000, 0xCC00, 0xCC00}};
+    Frame moving_cubes6 = {{0x0000, 0x0660, 0x0660, 0x0000}};
+    Frame moving_cubes7 = {{0x0033, 0x0033, 0x0000, 0x0000}};
+    Frame moving_cubes8 = {{0x0330, 0x0330, 0x0000, 0x0000}};
+
+    moving_cubes.speed = 10;
+    moving_cubes.time = 3;
+    moving_cubes.nr_frames = 8;   
+    memset(moving_cubes.frames, 0, MAX_FRAMES*sizeof(Frame));  
+    moving_cubes.frames[0] = moving_cubes1;
+    moving_cubes.frames[1] = moving_cubes2;
+    moving_cubes.frames[2] = moving_cubes3;
+    moving_cubes.frames[3] = moving_cubes4;
+    moving_cubes.frames[4] = moving_cubes5;
+    moving_cubes.frames[5] = moving_cubes6;
+    moving_cubes.frames[6] = moving_cubes7;
+    moving_cubes.frames[7] = moving_cubes8;
+   
+    animations[0] = rotate_horizontal;
+    //animations[1] = carrousel;
+    animations[1] = moving_cubes;
+
+}
+
+void next_animation()
+{
+    current_animation++;
+    animation_time = 0;    
+    if (current_animation == MAX_ANIMATIONS)
+    {
+        current_animation = 0;
+    }
+}
+
+void draw_frame(void)
+{          
+    for (int i=0; i<NR_LAYERS; i++)
+    {     
+        shiftOut_spi(animations[current_animation].frames[current_frame].data[i] >> 8);
+        shiftOut_spi(animations[current_animation].frames[current_frame].data[i]);
+
+        PORTB |= (1 << LATCH_PIN);
+        PORTB &= ~(1 << LATCH_PIN);
+
+        PORTD &= ~(1 << LAYER_PINS[i]);
+        _delay_ms(3);
+        PORTD |= (1 << LAYER_PINS[i]);
+    }
+
+    f_draw_frame = false;
+}
+
+void shiftOut_spi(uint8_t data)
+{
+    SPDR = data;
+    // wait until SPI transfer is finished
+    while(!(SPSR & (1<<SPIF)));	
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+    f_draw_frame = true;    
+}
